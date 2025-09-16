@@ -1,6 +1,6 @@
 <?php
 // Класс для генерации 'id' таблицы
-// Версия класса => 1.5.0
+// Версия класса => 2.0.0
 namespace App\Services;
 
 use Illuminate\Support\Facades\Cache;
@@ -28,10 +28,12 @@ class GenerateID {
     // Отключение кэша
     protected bool $use_cache       = true;
 
-    // Кэширование сгенерированных 'id'
+    // Время жизни резерва 'id' в секундах
+    protected int $lock_ttl         = 1800;
+
+    // Локальное кэширование сгенерированных 'id'
     private array $generatedIDs     = [];
-
-
+    
     public function __construct() {
         
     }
@@ -93,29 +95,44 @@ class GenerateID {
         return $this;
     }
 
-    public function noCache(bool $use_cache = false): self {
+    // Включение/отключение кеширования
+    public function useCache(bool $use_cache = false): self {
         $this->use_cache = $use_cache;
 
         return $this;
     }
 
+    // Установка времени жизни резервирования id в кеше
+    public function lockTtl(int $seconds): self {
+        $this->lock_ttl = max(60, $seconds);
+        return $this;
+    }
+
     // Сгенерировать и получить 'id'
     public function get(): ?string {
+        if (!isset($this->table_name) || trim($this->table_name) === '') {
+            throw new \LogicException('Table must be set before calling get().');
+        }
+
+        // Сброс кэша (на всякий случай)
+        $this->generatedIDs = [];
+        
         // Текущая попытка
-        $attempts = 1;
+        $attempts = 0;
         
         do{
+            // Попытка +1
+            $attempts++;
+            
             // Если есть принудительный 'id', берем его, если нет, генерируем новый
             $id = $this->force_id ?? $this->generateId();
             $this->force_id = null;
-
-            // Попытка +1
-            $attempts++;
 
             // Проверка на наличие сгенерированного id в кэше данного запроса
             if(isset($this->generatedIDs[$id])) {
                 continue;
             }
+            
             // Добавляем id в кэш текущего запроса
             $this->generatedIDs[$id] = true;
 
@@ -123,12 +140,15 @@ class GenerateID {
                 // Формируем ключ кэша с учетом таблицы
                 $cacheKey = 'aid_lock:'. $this->table_name .':'. $id;
     
-                // Проверка на наличие сгенерированного id в кэше
-                if(Cache::has($cacheKey)) {
+                $payload = json_encode([
+                    'ts'    => now()->toIso8601String(),
+                    'table' => $this->table_name,
+                ], JSON_UNESCAPED_UNICODE);
+
+                // add() — атомарно; если ключ уже есть → кто-то держит бронь
+                if (!Cache::add($cacheKey, $payload, $this->lock_ttl)) {
                     continue;
                 }
-                // Добавляем id в кэш
-                Cache::forever($cacheKey, true);
             }
 
             // Проверка на наличие сгенерированного id в БД
@@ -147,7 +167,7 @@ class GenerateID {
             return $id;
         }
         // Если id есть в БД и шаги не кончились делаем повторную генерацию.
-        while($attempts <= $this->max_generate);
+        while($attempts < $this->max_generate);
         
         Log::error('Error generating ID: failed after '. $this->max_generate .' attempts in table "'. $this->table_name .'", column "'. $this->column_name .'"');
         
@@ -155,9 +175,12 @@ class GenerateID {
     }
 
     protected function generateId():string {
-        return implode('', array_map(function() {
-            return $this->alphabet[array_rand($this->alphabet)];
-        }, range(1, $this->length)));
+        $len = count($this->alphabet);
+        $out = '';
+        for ($i = 0; $i < $this->length; $i++) {
+            $out .= $this->alphabet[random_int(0, $len - 1)];
+        }
+        return $out;
     }
 
     private function validateNotEmpty(string $value, string $message): void {
